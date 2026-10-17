@@ -127,6 +127,16 @@ The three-robot demo does not run SLAM. In a gap too narrow for an offset, two r
 
 Nav2, Open-RMF, one SLAM map per robot, and a physical robot are outside this repository.
 
+## Demo video
+
+Place a short screen capture in `media/demo.gif` or `media/demo.mp4` showing:
+
+1. The three robots and the three walkers in Gazebo.
+2. A Publish Point click on one robot, then a click on its goal in RViz.
+3. That robot following the path while the other two stay put, including a pass around another robot or a walker.
+
+Capture tips are in [`media/README.md`](media/README.md). Until the file is added, run the live demo with `./start_fleet_demo.sh --gui`.
+
 ## Layout
 
 ```text
@@ -138,6 +148,7 @@ src/fleet_nav/                 ament_python package
   maps/                        saved grid
   urdf/ worlds/
 tests/                         unittest, no ROS
+media/                         future demo.gif or demo.mp4
 docs/architecture.md
 docs/ROADMAP.md
 ```
