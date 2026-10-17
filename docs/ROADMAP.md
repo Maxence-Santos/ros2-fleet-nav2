@@ -1,22 +1,22 @@
 # Roadmap
 
-## v1 — en place
+## v1 — in place
 
-- [x] Trois AMR, namespaces `/robot_1` `/robot_2` `/robot_3`, TF séparés, `/tf` global.
-- [x] Carte d’entrepôt partagée, un seul publisher `/map`.
-- [x] A* par robot. Le chemin reste à 0,25 m des obstacles. Le suivi colle à la ligne. Le pivot n’a lieu que si un côté est un mur (moins de 0,50 m) et l’autre laisse 0,80 m.
-- [x] `fleet_manager` : mission au robot libre le plus proche.
-- [x] Recovery : timeout sans progression, exclusion, cooldown, retry si tout le monde est exclu.
-- [x] Tests unitaires de l’affectation et d’un chemin sur la carte réelle.
-- [x] Cartographie à un robot (`start_slam_demo.sh`) et export `save_map.py`, comme le projet 1.
-- [x] La démo charge `src/fleet_nav/maps/warehouse_map`.
-- [x] Clic RViz : sélection du robot, puis cible (`/fleet/direct`).
-- [x] Évitement lidar des robots et des personnes : parallèle à 0,75 m, droite de chacun en face à face, arrêt si un mobile coupe la trajectoire par la droite.
-- [x] Trois personnes en allée, absentes du monde de cartographie.
+- [x] Three AMRs, namespaces `/robot_1` `/robot_2` `/robot_3`, separate TF, global `/tf`.
+- [x] One shared warehouse map, a single `/map` publisher.
+- [x] A* per robot. The path stays 0.25 m from obstacles. Tracking sticks to the line. A pivot happens only when one side is a wall (under 0.50 m) and the other leaves 0.80 m.
+- [x] `fleet_manager`: mission to the nearest idle robot.
+- [x] Recovery: timeout without progress, exclusion, cooldown. A dropped goal is not handed to another robot. The library can still requeue when `requeue` is true; the demo never sets that.
+- [x] Unit tests for assignment and for a path on the real map.
+- [x] One-robot mapping (`start_slam_demo.sh`) and `save_map.py`, as in project 1.
+- [x] The demo loads `src/fleet_nav/maps/warehouse_map`.
+- [x] RViz click: select the robot, then the goal (`/fleet/direct`).
+- [x] Lidar avoidance of robots and people: 0.75 m parallel, each robot's own right head-on, stop when a moving robot cuts the trajectory from the right.
+- [x] Three people in the aisles, absent from the mapping world.
 
-## Hors de ce dépôt
+## Outside this repository
 
-- [ ] Nav2 multi-instance à la place de l’A* custom.
+- [ ] Multi-instance Nav2 instead of the custom A*.
 - [ ] Open-RMF.
-- [ ] SLAM distribué, une carte par robot.
-- [x] Publication GitHub : [Maxence-Santos/ros2-fleet-nav2](https://github.com/Maxence-Santos/ros2-fleet-nav2).
+- [ ] Distributed SLAM, one map per robot.
+- [x] GitHub publication: [Maxence-Santos/ros2-fleet-nav2](https://github.com/Maxence-Santos/ros2-fleet-nav2).

@@ -1,6 +1,6 @@
 # Architecture
 
-Trois navigateurs identiques, une carte, un répartiteur. La logique d’affectation est dans `FleetBook` et n’importe pas ROS : les tests la couvrent sans Gazebo.
+Three identical navigators, one map, one dispatcher. Assignment lives in `FleetBook` and does not import ROS: the tests cover it without Gazebo.
 
 ```mermaid
 flowchart LR
@@ -23,7 +23,7 @@ flowchart LR
   Bridge -->|/robot_N/odom /scan| N1
   Bridge -->|/robot_N/odom /scan| N2
   Bridge -->|/robot_N/odom /scan| N3
-  Bridge -->|/tf| TF[TF global]
+  Bridge -->|/tf| TF[global TF]
   Manager --> Map
   Manager --> Book
   N1 -->|nav_status| Manager
@@ -38,33 +38,33 @@ flowchart LR
   N3 -->|cmd_vel| Bridge
 ```
 
-## Repères
+## Frames
 
-| Repère | Qui le publie |
+| Frame | Who publishes it |
 | --- | --- |
-| `map` → `robot_N/odom` | TF statique identité. L’odométrie vérité-terrain est déjà dans le repère du monde, aligné sur `map` |
-| `robot_N/odom` → `robot_N/base_link` | `OdometryPublisher` Gazebo (pose du modèle), ponté vers `/tf` |
-| `robot_N/base_link` → laser, roues | `robot_state_publisher` avec `frame_prefix` |
+| `map` → `robot_N/odom` | Static identity. Ground-truth odometry is already in the world frame, aligned with `map` |
+| `robot_N/odom` → `robot_N/base_link` | Gazebo `OdometryPublisher` (model pose), bridged onto `/tf` |
+| `robot_N/base_link` → laser, wheels | `robot_state_publisher` with `frame_prefix` |
 
-Le topic Gazebo du DiffDrive est `/model/robot_N/cmd_vel`. Le pont le présente au navigateur comme `/robot_N/cmd_vel`. Même schéma pour l’odométrie, le scan et les joints.
+The Gazebo DiffDrive topic is `/model/robot_N/cmd_vel`. The bridge presents it to the navigator as `/robot_N/cmd_vel`. Odometry, scan, and joints use the same pattern.
 
-## Affectation
+## Assignment
 
-`tick` est le seul endroit où une mission change de robot.
+`tick` is the only place a queued mission changes robot.
 
-1. Un robot qui navigue sans s’être rapproché de 0,30 m depuis la dernière ancre, pendant 30 s, est annulé.
-2. Un statut `blocked` annule aussi. Le robot reste écarté 8 s.
-3. Le but est abandonné. Il ne retourne pas dans la file, et aucun autre robot ne part.
-4. `/fleet/mission` est donné une fois au robot libre le plus proche. Un clic (`/fleet/direct`) ne vise que le robot sélectionné.
+1. A navigating robot that has not closed 0.30 m since the last progress anchor, for 30 s, is cancelled.
+2. A `blocked` status cancels as well. The robot stays excluded for 8 s.
+3. The goal is dropped. It does not return to the queue, and no other robot leaves.
+4. `/fleet/mission` is given once to the nearest idle robot. A click (`/fleet/direct`) addresses only the selected robot.
 
-L’ancre de distance ne bouge pas à chaque échantillon d’odométrie. Elle avance seulement quand le robot a vraiment gagné 0,30 m. Sinon un flux d’odom à 50 Hz masquerait un robot arrêté.
+The distance anchor does not move on every odometry sample. It advances only when the robot has actually gained 0.30 m. Otherwise a 50 Hz odom stream would hide a stopped robot.
 
-Un but dont `frame_id` vaut `cancel` arrête le navigateur. Le répartiteur l’envoie quand il retire la mission, pour que le robot ne continue pas vers l’ancien point.
+A goal whose `frame_id` is `cancel` stops the navigator. The dispatcher sends it when it removes the mission, so the robot does not keep driving toward the old point.
 
-## Clic dans RViz
+## Click in RViz
 
-`click_goal` écoute `/clicked_point` (outil Publish Point). Si le point est à moins de 0,7 m d’un robot, ce robot devient la sélection. Sinon le point part sur `/fleet/direct` avec `frame_id` égal au nom du robot. `FleetBook.command` remplace la mission de ce robot seulement.
+`click_goal` listens to `/clicked_point` (Publish Point). If the point is within 0.7 m of a robot, that robot becomes the selection. Otherwise the point is published on `/fleet/direct` with `frame_id` equal to the robot name. `FleetBook.command` replaces only that robot's mission.
 
-## Carte
+## Map
 
-`start_slam_demo.sh` lance `robot_1`, `slam_toolbox` et le clavier. `save_map.py` écrit `src/fleet_nav/maps/warehouse_map.yaml` et le `.pgm`. `start_fleet_demo.sh` passe ce chemin au lancement. Les trois navigateurs planifient dessus. Il n’y a pas de SLAM pendant la démo à trois robots.
+`start_slam_demo.sh` starts `robot_1`, `slam_toolbox`, and the keyboard. `save_map.py` writes `src/fleet_nav/maps/warehouse_map.yaml` and the `.pgm`. `start_fleet_demo.sh` passes that path at launch. All three navigators plan on it. There is no SLAM during the three-robot demo.
