@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<sdf version="1.8" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Cylinder and head from ros2-slam-nav2. The lidar plane is at z=0.25. -->
+  <xacro:arg name="body_rgba" default="0.9 0.1 0.1 1"/>
+  <xacro:property name="body_rgba" value="$(arg body_rgba)"/>
+  <model name="person">
+    <link name="link">
+      <inertial>
+        <mass>50.0</mass>
+        <inertia>
+          <ixx>1.0</ixx><ixy>0.0</ixy><ixz>0.0</ixz>
+          <iyy>1.0</iyy><iyz>0.0</iyz><izz>1.0</izz>
+        </inertia>
+      </inertial>
+      <collision name="col">
+        <geometry><cylinder><radius>0.25</radius><length>1.5</length></cylinder></geometry>
+      </collision>
+      <visual name="vis_body">
+        <geometry><cylinder><radius>0.25</radius><length>1.2</length></cylinder></geometry>
+        <material>
+          <ambient>${body_rgba}</ambient>
+          <diffuse>${body_rgba}</diffuse>
+        </material>
+      </visual>
+      <visual name="vis_head">
+        <pose>0 0 0.8 0 0 0</pose>
+        <geometry><sphere><radius>0.2</radius></sphere></geometry>
+        <material>
+          <ambient>0.9 0.8 0.6 1</ambient>
+          <diffuse>0.9 0.8 0.6 1</diffuse>
+        </material>
+      </visual>
+    </link>
+    <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+      <link_name>link</link_name>
+    </plugin>
+  </model>
+</sdf>

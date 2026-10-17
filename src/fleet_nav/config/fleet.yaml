@@ -1,0 +1,13 @@
+# The saved map does not cover the whole 10 m warehouse. These poses are
+# inside the known free space, clear of the shelves at (2, 2) and (-2, -2).
+timeout_s: 30.0
+progress_m: 0.3
+cooldown_s: 8.0
+robots:
+  robot_1: {x: -3.7, y: -3.7, rgba: "0.20 0.40 0.90 1"}
+  robot_2: {x: 0.6, y: -3.6, rgba: "0.90 0.45 0.12 1"}
+  robot_3: {x: -0.2, y: -0.8, rgba: "0.15 0.65 0.35 1"}
+demo_goals:
+  - [-3.5, -1.6]   # nearest: robot_1
+  - [0.7, -2.4]    # nearest: robot_2
+  - [-0.05, 1.15]  # nearest: robot_3
