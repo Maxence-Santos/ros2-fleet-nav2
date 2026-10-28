@@ -134,27 +134,27 @@ Nav2, Open-RMF, one SLAM map per robot, and a physical robot are outside this re
 
 Four captures of the live fleet.
 
-### The green robot passes the parked orange robot
+### Perpendicular crossing
 
-https://github.com/user-attachments/assets/bbb7efdd-9bc8-4bb1-ae4e-74d588844fbd
+https://github.com/user-attachments/assets/ba8a44c7-2d5f-49b7-b2c3-1ead39167847
 
-The green robot crosses the open floor and passes the parked orange robot on the shelf side, then continues. The blue robot stays at the bottom of the aisle.
+The green robot and the orange robot meet where their paths cross. The green robot goes across while the orange robot gives way beside it. The blue robot stays at the bottom of the aisle.
 
-### The blue robot passes the pedestrian in its aisle
+### Avoidance of a pedestrian
 
-https://github.com/user-attachments/assets/acc570a7-fca1-4c73-b4c5-3fa1833e6622
+https://github.com/user-attachments/assets/3bae9ee8-d5ff-4f7d-ae7c-8b88024b15ca
 
 The blue robot drives along the aisle beside the shelf, meets the blue pedestrian walking there, and passes on the wall side with a gap. The green and orange robots stay where they are.
 
-### The orange robot crosses while the green robot waits
+### Avoidance of a still robot
 
-https://github.com/user-attachments/assets/6c2e035c-b3af-42b8-99c9-ec8eb965f444
+https://github.com/user-attachments/assets/df2ea426-eed0-4a58-ae6e-d18e5d20d7cf
 
-The two paths cross. The orange robot follows its curve and goes past the green robot. The green robot stays on its straight path and waits until the orange robot has passed.
+The orange robot drives around the green robot, which stays in place, and continues along its curve.
 
-### The green robot drives around the shelf
+### Avoidance of a shelf
 
-https://github.com/user-attachments/assets/aa524637-61aa-4d71-b109-cd2bb37f0208
+https://github.com/user-attachments/assets/78a4b29d-1666-447a-ba90-b5e5f06f1970
 
 The green robot follows its path around the end of the shelf and along the far side. The orange robot stays in the central aisle.
 
