@@ -5,10 +5,57 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import yaml
 from PIL import Image
+
+# Centre of a planned path stays at least this far from a parked robot.
+# Each chassis reaches about 0.22 m, so the footprints still have a gap
+# when the path runs past at this radius.
+FLEET_PEER_RADIUS = 0.68
+
+# Below this, a peer is not driving. The plan may treat them as a wall.
+PEER_STILL_SPEED = 0.08
+
+
+def peer_motion_speed(reported: float, displacement_m: float, dt: float) -> float:
+    """Speed used to decide that a peer is standing still.
+
+    ``reported`` is the odometry twist. That field stays at zero on some
+    bridges while the pose itself is moving, and a robot crossing the path
+    was then planned around. Once the window is long enough, the pose change
+    is the speed. A step above 1.5 m/s is a fresh sample, not motion.
+    """
+    if dt < 0.15:
+        return reported
+    derived = displacement_m / dt
+    if derived > 1.5:
+        return reported
+    return max(reported, derived)
+
+
+def peer_is_planning_obstacle(speed: float) -> bool:
+    """True when the plan should route around this peer."""
+    return speed < PEER_STILL_SPEED
+
+
+def hold_crossing_path(active: bool, side: float, cross_hold: float) -> bool:
+    """True while this robot is stopped so another one can cross.
+
+    The path already goes through the meeting point. Replacing it sends
+    this robot around the one that has the right of way.
+    """
+    return active and side == 0.0 and cross_hold != 0.0
+
+# warehouse.sdf shelves, axis-aligned (x0, x1, y0, y1). The saved image
+# leaves these boxes unknown or free, so a lidar hit on the face is shorter
+# than the grid ray and the contact walks along the face like a walker.
+WAREHOUSE_SHELVES = (
+    (1.5, 2.5, 0.5, 3.5),
+    (-2.5, -1.5, -3.5, -0.5),
+)
 
 from fleet_nav.navigation_geometry import (
     astar_grid,
@@ -17,6 +64,31 @@ from fleet_nav.navigation_geometry import (
     path_lookahead,
     simplify_path,
 )
+
+
+def _shelf_range(x: float, y: float, angle: float, max_range: float) -> float:
+    """Distance to the first warehouse shelf face, or ``max_range``."""
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+    best = max_range
+    for x0, x1, y0, y1 in WAREHOUSE_SHELVES:
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return 0.0
+        if abs(dx) > 1e-9:
+            for edge in (x0, x1):
+                travel = (edge - x) / dx
+                if 0.0 < travel < best:
+                    crossed = y + travel * dy
+                    if y0 <= crossed <= y1:
+                        best = travel
+        if abs(dy) > 1e-9:
+            for edge in (y0, y1):
+                travel = (edge - y) / dy
+                if 0.0 < travel < best:
+                    crossed = x + travel * dx
+                    if x0 <= crossed <= x1:
+                        best = travel
+    return best
 
 
 @dataclass
@@ -47,26 +119,44 @@ class OccupancyMap:
         half_angle: float = 0.61,
         max_range: float = 3.0,
         samples: int = 9,
+        lidar_x: float | None = None,
+        lidar_y: float | None = None,
     ) -> float:
-        """Nearest known occupied cell along ``yaw``, or ``max_range``.
+        """Nearest mapped wall or shelf along ``yaw``, or ``max_range``.
 
         With ``samples`` above 1, the ray is repeated across ±``half_angle``.
         Unknown cells and the edge of the grid are not walls: a grey cell was
         stopping the ray and every lidar return then looked like the map.
+        The shelf boxes are the exception. They are solid in the world and
+        missing from the image, and a ray that passes through them reports
+        the face. ``lidar_x`` and ``lidar_y`` are the real scan origin when
+        ``x, y`` is the point 0.10 m ahead of it: a grazing ray from that
+        forward point misses the corner the scan hits.
         """
         nearest = max_range
         if samples <= 1:
-            return self._ray_to_mapped(x, y, yaw, max_range)
+            return self._ray_to_mapped(x, y, yaw, max_range, lidar_x, lidar_y)
         for index in range(samples):
             angle = yaw - half_angle + (2.0 * half_angle) * index / (samples - 1)
-            nearest = min(nearest, self._ray_to_mapped(x, y, angle, max_range))
+            nearest = min(nearest, self._ray_to_mapped(x, y, angle, max_range, lidar_x, lidar_y))
         return nearest
 
-    def _ray_to_mapped(self, x: float, y: float, angle: float, max_range: float) -> float:
+    def _ray_to_mapped(
+        self,
+        x: float,
+        y: float,
+        angle: float,
+        max_range: float,
+        lidar_x: float | None = None,
+        lidar_y: float | None = None,
+    ) -> float:
         step = max(self.resolution, 0.02)
         height, width = self.display.shape
+        limit = _shelf_range(x, y, angle, max_range)
+        if lidar_x is not None and lidar_y is not None:
+            limit = min(limit, _shelf_range(lidar_x, lidar_y, angle, max_range))
         travelled = 0.0
-        while travelled < max_range:
+        while travelled < limit:
             travelled += step
             px = x + math.cos(angle) * travelled
             py = y + math.sin(angle) * travelled
@@ -75,10 +165,13 @@ class OccupancyMap:
             if row < 0 or col < 0 or row >= height or col >= width:
                 # Past the saved map is not a wall. Stopping here made every
                 # return look explained and the robot never passed anyone.
-                return max_range
+                # A shelf beyond the image is still the face the lidar hits.
+                if limit >= max_range:
+                    return max_range
+                continue
             if int(self.display[row, col]) == 100:
                 return travelled
-        return max_range
+        return limit
 
     def plan(
         self,
@@ -105,6 +198,47 @@ class OccupancyMap:
             self.segment_free,
             resolution=self.resolution,
         )
+
+    def plan_around(
+        self,
+        start_xy: tuple[float, float],
+        goal_xy: tuple[float, float],
+        mates: Sequence[tuple[float, float, float]],
+        radius: float = FLEET_PEER_RADIUS,
+        escape_m: float = 0.60,
+    ) -> list[tuple[float, float]]:
+        """Plan as usual, with each parked robot blocked out to ``radius``.
+
+        ``mates`` are ``(x, y, yaw)`` of bases that are not going to move.
+        The stored map is left alone: lidar rays still match the walls, and
+        only this plan treats those robots as obstacles. An empty list is the
+        ordinary plan.
+        """
+        if not mates:
+            return self.plan(start_xy, goal_xy, escape_m)
+        grid = self.grid.copy()
+        height, width = grid.shape
+        cells = max(1, int(math.ceil(radius / self.resolution)))
+        limit = cells * cells
+        for mate_x, mate_y, _mate_yaw in mates:
+            row, col = self.world_to_cell(mate_x, mate_y)
+            for d_row in range(-cells, cells + 1):
+                for d_col in range(-cells, cells + 1):
+                    if d_row * d_row + d_col * d_col > limit:
+                        continue
+                    blocked_row = row + d_row
+                    blocked_col = col + d_col
+                    if 0 <= blocked_row < height and 0 <= blocked_col < width:
+                        grid[blocked_row, blocked_col] = 1
+        blocked = OccupancyMap(
+            grid,
+            self.resolution,
+            self.origin_x,
+            self.origin_y,
+            self.display,
+            self.penalty,
+        )
+        return blocked.plan(start_xy, goal_xy, escape_m)
 
     def clearance(self, x: float, y: float) -> float:
         """Metres to the nearest known wall. Chebyshev, so it never over-reads."""

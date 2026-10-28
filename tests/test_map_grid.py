@@ -7,7 +7,13 @@ import unittest
 import numpy as np
 import yaml
 
-from fleet_nav.map_grid import OccupancyMap, load_occupancy
+from fleet_nav.map_grid import (
+    OccupancyMap,
+    hold_crossing_path,
+    load_occupancy,
+    peer_is_planning_obstacle,
+    peer_motion_speed,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +26,35 @@ class WarehouseMapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.occupancy = load_occupancy(MAP)
+
+    def test_a_crossing_robot_is_not_a_wall_and_the_wait_keeps_the_path(self):
+        # Twist left at zero, pose moving at cruise. That robot is crossing.
+        speed = peer_motion_speed(0.0, 0.30 * 0.20, 0.20)
+        self.assertGreater(speed, 0.20)
+        self.assertFalse(peer_is_planning_obstacle(speed))
+        # A robot that has not moved is still an obstacle for the plan.
+        still = peer_motion_speed(0.0, 0.0, 0.20)
+        self.assertTrue(peer_is_planning_obstacle(still))
+        # One short sample keeps the twist. A jump is not a cruise.
+        self.assertAlmostEqual(peer_motion_speed(0.0, 0.04, 0.10), 0.0)
+        self.assertAlmostEqual(peer_motion_speed(0.0, 0.40, 0.20), 0.0)
+        # The robot that stopped for the crossing keeps its path.
+        self.assertTrue(hold_crossing_path(True, 0.0, -1.0))
+        # Priority, a side pass, and a finished wait may still replan.
+        self.assertFalse(hold_crossing_path(True, 0.0, 0.0))
+        self.assertFalse(hold_crossing_path(True, 1.0, 0.0))
+        self.assertFalse(hold_crossing_path(False, 0.0, -1.0))
+
+    def test_a_ray_stops_on_the_shelf_the_image_left_open(self):
+        # East of the south shelf, looking west. The image lets this ray
+        # through the box; the face is at x=-1.5.
+        origin_x = -0.35
+        hit = self.occupancy.range_to_mapped(origin_x, -0.8, math.pi, samples=1)
+        self.assertAlmostEqual(hit, origin_x - (-1.5), delta=0.05)
+        # South of the north shelf, looking north. x=2 is outside the image,
+        # and the box is unknown where the image does cover it.
+        hit = self.occupancy.range_to_mapped(2.0, 0.0, math.pi / 2.0, samples=1)
+        self.assertAlmostEqual(hit, 0.5, delta=0.05)
 
     def test_shelf_is_blocked_and_spawns_are_free(self):
         shelf = self.occupancy.world_to_cell(2.0, 2.0)

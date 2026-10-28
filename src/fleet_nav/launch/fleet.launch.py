@@ -101,6 +101,7 @@ def generate_launch_description():
                 "spawn_x": float(spec["x"]),
                 "spawn_y": float(spec["y"]),
                 "map_yaml": map_yaml,
+                "peer_names": [other for other in fleet["robots"] if other != name],
             }],
         ))
         robot_actions.append(TimerAction(

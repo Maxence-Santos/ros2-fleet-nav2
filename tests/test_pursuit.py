@@ -23,6 +23,8 @@ from fleet_nav.navigation_geometry import (
     pursuit_command,
     simplify_path,
     robot_pass_side,
+    sector_body_returns,
+    sector_distances_from_scan,
     select_evasion_side,
     side_arrival,
     step_avoidance,
@@ -427,6 +429,25 @@ class PursuitTests(unittest.TestCase):
         self.assertGreater(angular, 0.4)
         self.assertFalse(stalling)
 
+    def test_a_u_turn_spins_in_place_even_after_cruise(self):
+        # Already cruising, goal straight behind. Rolling through the turn
+        # leaves the chassis beside the path for the rest of the leg.
+        linear, angular, stalling = command_on_path(
+            0.0, 0.0, 0.0,
+            -1.2, 0.05,
+            front=2.0,
+            max_linear=0.30,
+            max_angular=1.0,
+            stop_distance=0.45,
+            left=1.8,
+            right=1.4,
+            lateral=0.04,
+            align=False,
+        )
+        self.assertEqual(linear, 0.0)
+        self.assertGreater(abs(angular), 0.4)
+        self.assertFalse(stalling)
+
     def test_a_staircase_around_an_edge_becomes_one_feasible_line(self):
         # Grid steps alternate straight and diagonal. Clearance stays at 0.80 m
         # on the stair and falls to 0.10 m if the line cuts the corner.
@@ -717,26 +738,31 @@ class PursuitTests(unittest.TestCase):
                     break
             return seen
 
-        # Trajectory stays to the right of the robot on our left: stop.
+        # That robot is on our left, so this one has priority. It stays on
+        # the path. Stopping here, or arcing left, is the perpendicular miss.
         yielded = cross(1.0, 0.0, 1.40, 0.85, -0.05)
         self.assertIsNotNone(yielded)
         command, side = yielded
-        self.assertEqual(command, (0.0, 0.0))
+        self.assertGreater(command[0], 0.20)
+        self.assertLess(abs(command[1]), 0.50)
         self.assertEqual(side, 0.0)
 
-        # Trajectory goes to its left: shift to our left and pass behind.
+        # The aim goes to that robot's left. They are still on our left, so
+        # the left arc is not the answer: this robot keeps the line.
         behind = cross(0.4, 1.2, 1.40, 0.85, -0.05)
         self.assertIsNotNone(behind)
         command, side = behind
-        self.assertEqual(side, -1.0)
-        self.assertGreater(command[1], 0.0)
+        self.assertGreater(command[0], 0.20)
+        self.assertLess(abs(command[1]), 0.50)
+        self.assertEqual(side, 0.0)
 
-        # The other robot sees us on its right and keeps passing. It does not stop.
+        # That robot is crossing from our right toward our left. A left offset
+        # follows it off the path. Stop instead, and let it go by.
         other = cross(1.0, 0.0, 1.40, -0.85, 0.05)
         self.assertIsNotNone(other)
         command, side = other
-        self.assertEqual(side, -1.0)
-        self.assertGreater(command[0], 0.0)
+        self.assertEqual(side, 0.0)
+        self.assertEqual(command, (0.0, 0.0))
 
         # Same place, but the body does not move in the world. The ordinary
         # right pass stays: a shrinking range at a fixed pose is not motion.
@@ -813,6 +839,1307 @@ class PursuitTests(unittest.TestCase):
         )
         self.assertEqual(command, (0.0, 0.0))
         self.assertEqual(state.side, 0.0)
+
+    def test_a_perpendicular_robot_is_stopped_for_instead_of_followed(self):
+        # The other robot crosses our path from the right. Offsetting left
+        # yaws into its direction, holds the parallel, and cannot rejoin.
+        # Stop while it is still in front and stay on our own line.
+        state = AvoidanceState()
+        x = y = yaw = 0.0
+        ox, oy = 1.70, -1.10
+        max_abs_y = 0.0
+        min_centre = 99.0
+        followed = False
+        stopped_while_ahead = False
+        for step in range(45):
+            dist = math.hypot(ox - x, oy - y)
+            bearing = math.atan2(
+                math.sin(math.atan2(oy - y, ox - x) - yaw),
+                math.cos(math.atan2(oy - y, ox - x) - yaw),
+            )
+            command, state = step_avoidance(
+                state, step * 0.1, x, y, yaw,
+                1.0, 0.0, 1.2, 0.0,
+                front=max(0.05, dist - 0.18), left=2.0, right=2.0,
+                heading_error=0.0,
+                map_range=6.0,
+                path_x=0.0, path_y=0.0,
+                bearing=bearing,
+            )
+            if command is None:
+                linear, angular = 0.30, 0.0
+            else:
+                linear, angular = command
+            if (
+                state.active and state.side != 0.0
+                and state.moving_frames >= 3 and state.other_speed >= 0.18
+            ):
+                followed = True
+            if (
+                command == (0.0, 0.0) and state.side == 0.0
+                and oy - y < 0.30
+            ):
+                stopped_while_ahead = True
+            yaw += angular * 0.1
+            x += linear * math.cos(yaw) * 0.1
+            y += linear * math.sin(yaw) * 0.1
+            oy += 0.030
+            max_abs_y = max(max_abs_y, abs(y))
+            min_centre = min(min_centre, math.hypot(ox - x, oy - y))
+            if oy - y > 1.0 and step > 15:
+                break
+        self.assertFalse(followed)
+        self.assertTrue(stopped_while_ahead)
+        self.assertLess(max_abs_y, 0.25)
+        self.assertGreater(min_centre, 0.70)
+
+    def test_the_robot_that_reaches_the_crossing_first_keeps_its_line(self):
+        # Crossing at (2, 0). The northbound robot has 1.0 m to go and the
+        # eastbound one 1.1 m. The closer one used to stop across the other's
+        # path, and the later one drove through the open crossing.
+        def drive(me, other, state, now):
+            sectors = self._walker_scan(
+                me["x"], me["y"], me["yaw"], other["x"], other["y"], radius=0.21,
+            )
+            hx, hy = math.cos(me["hd"]), math.sin(me["hd"])
+            aim_x = me["x"] + 0.80 * hx
+            aim_y = me["y"] + 0.80 * hy
+            error = math.atan2(
+                math.sin(me["hd"] - me["yaw"]), math.cos(me["hd"] - me["yaw"]),
+            )
+            front = sectors.front if sectors.front < 900.0 else 999.0
+            left = sectors.left if sectors.left < 900.0 else 4.0
+            right = sectors.right if sectors.right < 900.0 else 4.0
+            command, state = step_avoidance(
+                state, now, me["x"], me["y"], me["yaw"],
+                hx, hy, aim_x - me["x"], aim_y - me["y"],
+                front, left, right, error,
+                map_range=8.0, map_left=8.0, map_right=8.0,
+                path_x=me["px"], path_y=me["py"],
+                bearing=0.0 if sectors.front > 900.0 else sectors.front_angle,
+                left_bearing=None if sectors.left > 900.0 else sectors.left_angle,
+                right_bearing=None if sectors.right > 900.0 else sectors.right_angle,
+                dest_x=me["goal"][0] - me["x"], dest_y=me["goal"][1] - me["y"],
+            )
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    me["x"], me["y"], me["yaw"], aim_x, aim_y,
+                    min(front, 3.0), 0.30, 1.0, 0.45,
+                    left=min(left, 3.0), right=min(right, 3.0), align=False,
+                )
+                stopped = False
+            else:
+                linear, angular = command
+                stopped = command == (0.0, 0.0) and state.side == 0.0
+            return state, linear, angular, stopped
+
+        def scene(a, b):
+            sa = AvoidanceState()
+            sb = AvoidanceState()
+            min_d = 99.0
+            stop_a = stop_b = 0
+            for step in range(70):
+                now = step * 0.1
+                sa, lin_a, ang_a, stopped_a = drive(a, b, sa, now)
+                sb, lin_b, ang_b, stopped_b = drive(b, a, sb, now)
+                if stopped_a:
+                    stop_a += 1
+                if stopped_b:
+                    stop_b += 1
+                a["yaw"] += ang_a * 0.1
+                b["yaw"] += ang_b * 0.1
+                a["x"] += lin_a * math.cos(a["yaw"]) * 0.1
+                a["y"] += lin_a * math.sin(a["yaw"]) * 0.1
+                b["x"] += lin_b * math.cos(b["yaw"]) * 0.1
+                b["y"] += lin_b * math.sin(b["yaw"]) * 0.1
+                min_d = min(min_d, math.hypot(a["x"] - b["x"], a["y"] - b["y"]))
+                if a["mark"] is None and a["x"] >= 2.0:
+                    a["mark"] = (a["x"], a["y"], b["x"], b["y"])
+                if b["mark"] is None and b["y"] >= 0.0:
+                    b["mark"] = (a["x"], a["y"], b["x"], b["y"])
+            return a, b, min_d, stop_a, stop_b
+
+        def robot(x, y, hd, goal, px, py):
+            return {
+                "x": x, "y": y, "yaw": hd, "hd": hd, "goal": goal,
+                "px": px, "py": py, "mark": None,
+            }
+
+        # Northbound is on the eastbound robot's right, so it has priority
+        # even when the distances are almost the same. Eastbound waits.
+        a = robot(0.9, 0.0, 0.0, (4.0, 0.0), 0.0, 0.0)
+        b = robot(2.0, -1.0, math.pi / 2, (2.0, 3.0), 2.0, -3.0)
+        a, b, min_d, stop_a, stop_b = scene(a, b)
+        self.assertIsNotNone(b["mark"])
+        self.assertLess(b["mark"][0], 1.50)
+        self.assertLess(abs(b["mark"][2] - 2.0), 0.35)
+        self.assertGreater(stop_a, stop_b)
+        self.assertGreater(min_d, 0.55)
+
+        # Southbound is on the eastbound robot's left. Eastbound has priority
+        # and keeps the line. Who is closer does not change the side.
+        a = robot(1.5, 0.0, 0.0, (4.0, 0.0), 0.0, 0.0)
+        b = robot(2.0, 1.7, -math.pi / 2, (2.0, -3.0), 2.0, 3.0)
+        a, b, min_d, stop_a, stop_b = scene(a, b)
+        self.assertIsNotNone(a["mark"])
+        self.assertGreater(a["mark"][3], 0.40)
+        self.assertLess(abs(a["mark"][1]), 0.35)
+        self.assertGreater(stop_b, stop_a)
+        self.assertGreater(min_d, 0.55)
+
+    def _square_robot_ranges(self, x, y, yaw, ox, oy, oyaw):
+        """Lidar ranges to the other chassis, from the sensor 0.15 m ahead."""
+        lx = x + 0.15 * math.cos(yaw)
+        ly = y + 0.15 * math.sin(yaw)
+        samples = 360
+        inc = 2.0 * math.pi / samples
+        ranges = []
+        c, s = math.cos(oyaw), math.sin(oyaw)
+        half = 0.15
+        for index in range(samples):
+            angle = -math.pi + index * inc
+            dx, dy = math.cos(yaw + angle), math.sin(yaw + angle)
+            # Other chassis, in its own frame.
+            bx = c * (lx - ox) + s * (ly - oy)
+            by = -s * (lx - ox) + c * (ly - oy)
+            rdx = c * dx + s * dy
+            rdy = -s * dx + c * dy
+            hit = None
+            for edge, origin, direction, other_o, other_d in (
+                (half, bx, rdx, by, rdy),
+                (-half, bx, rdx, by, rdy),
+                (half, by, rdy, bx, rdx),
+                (-half, by, rdy, bx, rdx),
+            ):
+                if abs(direction) < 1e-9:
+                    continue
+                t = (edge - origin) / direction
+                if t <= 0.05:
+                    continue
+                other = other_o + t * other_d
+                if -half - 1e-6 <= other <= half + 1e-6 and (hit is None or t < hit):
+                    hit = t
+            ranges.append(hit if hit is not None and 0.15 < hit <= 3.0 else float("inf"))
+        return ranges, inc
+
+    def _square_cross(
+        self, ax, ay, bx, by, b_dir=1.0, steps=140, bias=0.0,
+        wobble=0.0, blank_every=0,
+    ):
+        """Eastbound A on y=ay. B travels on x=bx, north if b_dir > 0.
+
+        Square lidar, empty sectors stay 999, map ray is 3 m. ``bias`` shifts
+        finite ranges so a noisy sweep cannot pick a different robot.
+        """
+        def make(x, y, heading, goal):
+            path = []
+            for i in range(40):
+                a = i / 39.0
+                path.append((x + (goal[0] - x) * a, y + (goal[1] - y) * a))
+            return {
+                "x": x, "y": y, "yaw": heading, "v": 0.0, "w": 0.0,
+                "goal": goal, "path": path, "cruise": False, "index": 0,
+            }
+
+        def advance(me):
+            path = me["path"]
+            index = me["index"]
+            while index < len(path) - 1:
+                waypoint = path[index]
+                if math.hypot(waypoint[0] - me["x"], waypoint[1] - me["y"]) < 0.25:
+                    index += 1
+                    continue
+                heading = path_heading(path, index, waypoint[0], waypoint[1], me["x"], me["y"])
+                along = (me["x"] - waypoint[0]) * math.cos(heading) + (me["y"] - waypoint[1]) * math.sin(heading)
+                if along > 0.0:
+                    index += 1
+                    continue
+                break
+            me["index"] = index
+
+        def drive(me, other, state, now):
+            advance(me)
+            ranges, inc = self._square_robot_ranges(
+                me["x"], me["y"], me["yaw"], other["x"], other["y"], other["yaw"],
+            )
+            sectors = sector_distances_from_scan(ranges, -math.pi, inc, range_min=0.15)
+            path = me["path"]
+            index = me["index"]
+            waypoint = path[max(0, min(index, len(path) - 1))]
+            aim = path_merge_target(me["x"], me["y"], path, index, waypoint[0], waypoint[1])
+            heading = path_heading(path, index, waypoint[0], waypoint[1], me["x"], me["y"])
+            error = math.atan2(
+                math.sin(math.atan2(aim[1] - me["y"], aim[0] - me["x"]) - me["yaw"]),
+                math.cos(math.atan2(aim[1] - me["y"], aim[0] - me["x"]) - me["yaw"]),
+            )
+            def shift(value, empty):
+                if value >= 900.0 or (blank_every and int(round(now * 10)) % blank_every == 0):
+                    return empty
+                extra = wobble if int(round(now * 10)) % 2 == 0 else -wobble
+                return max(0.05, value + bias + extra)
+
+            front = shift(sectors.front, 999.0)
+            left = shift(sectors.left, 999.0)
+            right = shift(sectors.right, 999.0)
+            command, state = step_avoidance(
+                state, now, me["x"], me["y"], me["yaw"],
+                math.cos(heading), math.sin(heading),
+                aim[0] - me["x"], aim[1] - me["y"],
+                front, left, right, error,
+                map_range=3.0, map_left=3.0, map_right=3.0,
+                path_x=waypoint[0], path_y=waypoint[1],
+                bearing=sectors.front_angle,
+                left_bearing=sectors.left_angle,
+                right_bearing=sectors.right_angle,
+                dest_x=me["goal"][0] - me["x"], dest_y=me["goal"][1] - me["y"],
+            )
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    me["x"], me["y"], me["yaw"], aim[0], aim[1], min(front, 3.0),
+                    0.30, 1.0, 0.45,
+                    left=min(left, 3.0), right=min(right, 3.0),
+                    lateral=path_lateral(me["x"], me["y"], path, index),
+                    align=not me["cruise"],
+                )
+                if abs(error) <= 0.30:
+                    me["cruise"] = True
+            else:
+                linear, angular = command
+            me["v"] += max(-0.10, min(0.10, linear - me["v"]))
+            me["w"] += max(-0.20, min(0.20, angular - me["w"]))
+            me["yaw"] += me["w"] * 0.1
+            me["x"] += me["v"] * math.cos(me["yaw"]) * 0.1
+            me["y"] += me["v"] * math.sin(me["yaw"]) * 0.1
+            stopped = command == (0.0, 0.0) and state.side == 0.0
+            behind = state.active and state.side < 0.0
+            offset = state.active and state.side != 0.0
+            lateral = path_lateral(me["x"], me["y"], path, me["index"])
+            return state, stopped, behind, lateral, linear, offset
+
+        a = make(ax, ay, 0.0, (ax + 8.0, ay))
+        b = make(bx, by, math.pi / 2 * (1.0 if b_dir > 0.0 else -1.0), (bx, by + 8.0 * b_dir))
+        sa, sb = AvoidanceState(), AvoidanceState()
+        stats = {
+            "stop_a": 0, "stop_b": 0, "lat_a": 0.0, "lat_b": 0.0,
+            "behind_a": False, "behind_b": False, "off_a": 0, "off_b": 0,
+            "min_d": 99.0,
+            "ax_when_b_clear": None, "by_when_a_clear": None,
+            "rev_late_a": 0, "rev_late_b": 0,
+            "rev_early_a": 0, "rev_early_b": 0,
+        }
+        late_from = max(0, steps - 40)
+        for step in range(steps):
+            now = step * 0.1
+            snap_a = {"x": a["x"], "y": a["y"], "yaw": a["yaw"]}
+            snap_b = {"x": b["x"], "y": b["y"], "yaw": b["yaw"]}
+            sa, stop_a, behind_a, lat_a, lin_a, off_a = drive(a, snap_b, sa, now)
+            sb, stop_b, behind_b, lat_b, lin_b, off_b = drive(b, snap_a, sb, now)
+            if step == late_from:
+                stats["ax_late"] = a["x"]
+                stats["ay_late"] = a["y"]
+                stats["bx_late"] = b["x"]
+                stats["by_late"] = b["y"]
+            if stop_a:
+                stats["stop_a"] += 1
+            if stop_b:
+                stats["stop_b"] += 1
+            stats["lat_a"] = max(stats["lat_a"], lat_a)
+            stats["lat_b"] = max(stats["lat_b"], lat_b)
+            stats["behind_a"] = stats["behind_a"] or behind_a
+            stats["behind_b"] = stats["behind_b"] or behind_b
+            if off_a:
+                stats["off_a"] += 1
+            if off_b:
+                stats["off_b"] += 1
+            stats["min_d"] = min(stats["min_d"], math.hypot(a["x"] - b["x"], a["y"] - b["y"]))
+            b_past = (b_dir > 0.0 and b["y"] >= ay + 0.70) or (b_dir < 0.0 and b["y"] <= ay - 0.70)
+            a_past = a["x"] >= bx + 0.55
+            if b_past and lin_a < -0.05:
+                stats["rev_late_a"] += 1
+            if a_past and lin_b < -0.05:
+                stats["rev_late_b"] += 1
+            if step < 15 and lin_a < -0.05:
+                stats["rev_early_a"] += 1
+            if step < 15 and lin_b < -0.05:
+                stats["rev_early_b"] += 1
+            if stats["ax_when_b_clear"] is None and b_past:
+                stats["ax_when_b_clear"] = a["x"]
+            if stats["by_when_a_clear"] is None and a["x"] >= bx + 0.35:
+                stats["by_when_a_clear"] = b["y"]
+        stats["ax"] = a["x"]
+        stats["ay"] = a["y"]
+        stats["bx"] = b["x"]
+        stats["by"] = b["y"]
+        return stats
+
+    def test_a_perpendicular_second_robot_stops_instead_of_passing_behind(self):
+        # Crossing at (2, 0). Empty sectors stay 999 and the map ray is the
+        # 3 m lidar limit. Priority is the robot that has the other on its
+        # left. The other stops on its line, then starts again once the first
+        # is past the crossing. Neither one arcs off the path.
+        def check(stats, yielder, where):
+            self.assertEqual(stats["off_a"], 0, where)
+            self.assertEqual(stats["off_b"], 0, where)
+            self.assertFalse(stats["behind_a"], where)
+            self.assertFalse(stats["behind_b"], where)
+            self.assertLess(stats["lat_a"], 0.20, where)
+            self.assertLess(stats["lat_b"], 0.20, where)
+            self.assertGreater(stats["min_d"], 0.60, where)
+            if yielder == "a":
+                self.assertIsNotNone(stats["ax_when_b_clear"], where)
+                self.assertLess(stats["ax_when_b_clear"], 1.85, where)
+                self.assertLess(abs(stats["bx"] - 2.0), 0.35, where)
+                self.assertGreater(stats["stop_a"], stats["stop_b"], where)
+                self.assertLess(stats["stop_b"], 8, where)
+                self.assertGreater(stats["ax"], stats["ax_when_b_clear"] + 0.30, where)
+                self.assertLess(abs(stats["ay"]), 0.20, where)
+                self.assertLess(stats["rev_late_a"], 3, where)
+            else:
+                self.assertIsNotNone(stats["by_when_a_clear"], where)
+                # Still on the north approach when A clears the crossing.
+                self.assertGreater(stats["by_when_a_clear"], 0.15, where)
+                self.assertLess(abs(stats["ay"]), 0.20, where)
+                self.assertGreater(stats["ax"], 2.30, where)
+                self.assertGreater(stats["stop_b"], stats["stop_a"], where)
+                self.assertLess(stats["stop_a"], 8, where)
+                self.assertLess(stats["by"], stats["by_when_a_clear"] - 0.30, where)
+                self.assertLess(abs(stats["bx"] - 2.0), 0.35, where)
+                self.assertLess(stats["rev_late_b"], 3, where)
+
+        # From the south, B is on A's right. A waits, including when A is closer.
+        for ax, by, bias in (
+            (1.0, -0.4, 0.0),
+            (1.0, -1.6, 0.0),
+            (0.4, -0.5, 0.0),
+            (1.4, -0.3, 0.0),
+            (1.0, -0.4, 0.06),
+            (1.0, -0.4, -0.06),
+        ):
+            stats = self._square_cross(ax, 0.0, 2.0, by, b_dir=1.0, bias=bias)
+            check(stats, "a", f"A from x={ax}, B from y={by}, bias={bias}")
+
+        # A is already on the crossing and B is still far up the aisle.
+        # A goes through. B must not freeze after A has left.
+        for ax, by, bias in ((1.6, -1.8, 0.0), (1.6, -1.8, 0.06)):
+            stats = self._square_cross(ax, 0.0, 2.0, by, b_dir=1.0, bias=bias)
+            where = f"A from x={ax}, B from y={by}, bias={bias}"
+            self.assertEqual(stats["off_a"], 0, where)
+            self.assertEqual(stats["off_b"], 0, where)
+            self.assertGreater(stats["min_d"], 0.60, where)
+            self.assertLess(stats["lat_a"], 0.20, where)
+            self.assertLess(stats["lat_b"], 0.20, where)
+            self.assertGreater(stats["by"], 1.0, where)
+            self.assertLess(stats["stop_b"], 16, where)
+            self.assertLess(stats["rev_late_a"], 3, where)
+            self.assertLess(stats["rev_late_b"], 3, where)
+
+        # From the north, B is on A's left. B waits, including when B is closer.
+        for ax, by, bias in (
+            (1.0, 0.4, 0.0),
+            (1.0, 1.6, 0.0),
+            (0.4, 1.8, 0.0),
+            (1.6, 0.5, 0.0),
+            (1.0, 0.4, -0.06),
+        ):
+            stats = self._square_cross(ax, 0.0, 2.0, by, b_dir=-1.0, bias=bias)
+            check(stats, "b", f"A from x={ax}, B from y={by}, bias={bias}")
+
+    def test_a_wobbly_perpendicular_crossing_stays_on_the_lines(self):
+        # A sweep that jitters, or drops the robot for one frame, used to
+        # start a side pass. One robot, or both, left the line and they met
+        # again on the way back. The robot with the other on its right still
+        # stops. The other does not arc off.
+        cases = (
+            (1.0, -0.4, 1.0, "a"),
+            (1.0, -1.6, 1.0, "a"),
+            (1.4, -0.3, 1.0, "a"),
+            (1.6, -1.8, 1.0, "far"),
+            (1.0, 0.4, -1.0, "b"),
+            (1.6, 0.5, -1.0, "b"),
+        )
+        for ax, by, direction, kind in cases:
+            for wobble, blank in ((0.05, 0), (0.0, 4)):
+                stats = self._square_cross(
+                    ax, 0.0, 2.0, by, b_dir=direction,
+                    wobble=wobble, blank_every=blank,
+                )
+                where = (
+                    f"A from x={ax}, B from y={by}, dir={direction}, "
+                    f"wobble={wobble}, blank={blank}"
+                )
+                self.assertEqual(stats["off_a"], 0, where)
+                self.assertEqual(stats["off_b"], 0, where)
+                # One dropped sweep on the close north start reads 0.598 m.
+                # The clean runs stay above 0.60. Below 0.55 the squares meet.
+                self.assertGreater(stats["min_d"], 0.55 if blank else 0.60, where)
+                self.assertLess(stats["lat_a"], 0.20, where)
+                self.assertLess(stats["lat_b"], 0.20, where)
+                self.assertLess(stats["rev_late_a"], 3, where)
+                self.assertLess(stats["rev_late_b"], 3, where)
+                if kind == "a":
+                    self.assertGreater(stats["stop_a"], stats["stop_b"], where)
+                    self.assertLess(stats["stop_b"], 8, where)
+                elif kind == "b":
+                    self.assertGreater(stats["stop_b"], stats["stop_a"], where)
+                    self.assertLess(stats["stop_a"], 8, where)
+                else:
+                    # Already in the crossing, with the other still up the
+                    # aisle. A goes through. A wobbling range can hold B's
+                    # pause, but B still clears the crossing and neither
+                    # robot arcs off. A dropped sweep must not freeze B.
+                    self.assertGreater(stats["ax"], 3.0, where)
+                    if wobble == 0.0:
+                        self.assertLess(stats["stop_b"], 16, where)
+                        self.assertGreater(stats["by"], 1.0, where)
+                    else:
+                        self.assertGreater(stats["by"], 0.40, where)
+
+    def test_a_speed_dip_does_not_stop_the_robot_that_has_priority(self):
+        # Seen at cruise, then the hit slows into the walker band while the
+        # other chassis is still in the forward sector and one flank. Releasing
+        # the straight command there makes path following stop, and both robots
+        # sit short of the intersection.
+        state = AvoidanceState()
+        ox, oy, oyaw = 0.70, 0.40, math.pi / 2
+        blocked = 0
+        now = 0.0
+        for speed, frames in ((-0.30, 6), (-0.15, 8)):
+            for _ in range(frames):
+                ranges, inc = self._square_robot_ranges(0.0, 0.0, 0.0, ox, oy, oyaw)
+                sectors = sector_distances_from_scan(ranges, -math.pi, inc, range_min=0.15)
+                command, state = step_avoidance(
+                    state, now, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                    sectors.front, sectors.left, sectors.right, 0.0,
+                    map_range=3.0, map_left=3.0, map_right=3.0,
+                    path_x=0.6, path_y=0.0,
+                    bearing=sectors.front_angle,
+                    left_bearing=sectors.left_angle,
+                    right_bearing=sectors.right_angle,
+                    dest_x=4.0, dest_y=0.0,
+                )
+                in_band = (
+                    state.seen_fast
+                    and 0.18 <= state.other_speed < 0.24
+                    and sectors.front < 0.45
+                    and min(sectors.left, sectors.right) < 0.50
+                )
+                if in_band:
+                    blocked += 1
+                    self.assertIsNotNone(command)
+                    self.assertGreater(command[0], 0.20)
+                    self.assertEqual(state.side, 0.0)
+                    self.assertTrue(state.cross_go)
+                oy += speed * 0.1
+                now += 0.1
+        self.assertGreater(blocked, 0)
+
+    def test_after_a_perpendicular_crossing_both_robots_leave_on_their_lines(self):
+        # Already near the intersection. The robot with priority used to yaw
+        # off its line, latch a yield, and then alternate forward and reverse
+        # on an empty scan after the other robot had left.
+        for ax, by, direction in (
+            (1.80, -0.60, 1.0),
+            (1.80, -0.30, 1.0),
+            (1.80, -0.75, 1.0),
+            (1.50, 0.30, -1.0),
+        ):
+            stats = self._square_cross(ax, 0.0, 2.0, by, b_dir=direction, steps=180)
+            where = f"A from x={ax}, B from y={by}, dir={direction}"
+            self.assertGreater(abs(stats["ax"] - stats["ax_late"]), 0.80, where)
+            self.assertGreater(abs(stats["by"] - stats["by_late"]), 0.80, where)
+            self.assertLess(stats["rev_late_a"], 3, where)
+            self.assertLess(stats["rev_late_b"], 3, where)
+            self.assertLess(abs(stats["ay"] - 0.0), 0.35, where)
+            self.assertLess(abs(stats["bx"] - 2.0), 0.35, where)
+
+    def test_a_far_crossing_does_not_stop_the_robot_on_the_left(self):
+        # Paths cross at (3, 0). B is still about 3 m down its aisle, inside
+        # the lidar but far from the crossing. The robot that has B on its
+        # right used to freeze as soon as that return existed.
+        stats = self._square_cross(0.0, 0.0, 3.0, -3.0, b_dir=1.0, steps=50)
+        self.assertGreater(stats["ax"], 1.00)
+        self.assertLess(stats["stop_a"], 20)
+        self.assertGreater(stats["min_d"], 1.50)
+        self.assertLess(stats["lat_a"], 0.20)
+        self.assertLess(stats["lat_b"], 0.20)
+        self.assertLess(stats["by"], -1.20)
+
+    def _square_face_gap(self, ax, ay, ayaw, bx, by, byaw, half=0.15):
+        """Positive when two oriented chassis squares are apart."""
+
+        def project(cx, cy, yaw, axis_x, axis_y):
+            c, s = math.cos(yaw), math.sin(yaw)
+            centre = cx * axis_x + cy * axis_y
+            extent = half * (abs(c * axis_x + s * axis_y) + abs(-s * axis_x + c * axis_y))
+            return centre, extent
+
+        best = -99.0
+        for yaw in (ayaw, byaw):
+            c, s = math.cos(yaw), math.sin(yaw)
+            for axis_x, axis_y in ((c, s), (-s, c)):
+                ca, ea = project(ax, ay, ayaw, axis_x, axis_y)
+                cb, eb = project(bx, by, byaw, axis_x, axis_y)
+                best = max(best, abs(ca - cb) - ea - eb)
+        return best
+
+    def _beside_cross(self, ax, by, b_dir=1.0, dwell=0, steps=80):
+        """Eastbound A on y=0, B on x=2. Both may sit still before they move."""
+
+        def make(x, y, heading, goal):
+            path = [
+                (x + (goal[0] - x) * i / 39.0, y + (goal[1] - y) * i / 39.0)
+                for i in range(40)
+            ]
+            return {
+                "x": x, "y": y, "yaw": heading, "v": 0.0, "w": 0.0,
+                "goal": goal, "path": path, "cruise": False, "index": 0,
+            }
+
+        def advance(me):
+            path, index = me["path"], me["index"]
+            while index < len(path) - 1:
+                waypoint = path[index]
+                if math.hypot(waypoint[0] - me["x"], waypoint[1] - me["y"]) < 0.25:
+                    index += 1
+                    continue
+                heading = path_heading(path, index, waypoint[0], waypoint[1], me["x"], me["y"])
+                along = (
+                    (me["x"] - waypoint[0]) * math.cos(heading)
+                    + (me["y"] - waypoint[1]) * math.sin(heading)
+                )
+                if along > 0.0:
+                    index += 1
+                    continue
+                break
+            me["index"] = index
+
+        def drive(me, other, state, now, move):
+            advance(me)
+            ranges, inc = self._square_robot_ranges(
+                me["x"], me["y"], me["yaw"], other["x"], other["y"], other["yaw"],
+            )
+            sectors = sector_distances_from_scan(ranges, -math.pi, inc, range_min=0.15)
+            path, index = me["path"], me["index"]
+            waypoint = path[max(0, min(index, len(path) - 1))]
+            aim = path_merge_target(me["x"], me["y"], path, index, waypoint[0], waypoint[1])
+            heading = path_heading(path, index, waypoint[0], waypoint[1], me["x"], me["y"])
+            error = math.atan2(
+                math.sin(math.atan2(aim[1] - me["y"], aim[0] - me["x"]) - me["yaw"]),
+                math.cos(math.atan2(aim[1] - me["y"], aim[0] - me["x"]) - me["yaw"]),
+            )
+            front = sectors.front if sectors.front < 900.0 else 999.0
+            left = sectors.left if sectors.left < 900.0 else 999.0
+            right = sectors.right if sectors.right < 900.0 else 999.0
+            command, state = step_avoidance(
+                state, now, me["x"], me["y"], me["yaw"],
+                math.cos(heading), math.sin(heading),
+                aim[0] - me["x"], aim[1] - me["y"],
+                front, left, right, error,
+                map_range=3.0, map_left=3.0, map_right=3.0,
+                path_x=waypoint[0], path_y=waypoint[1],
+                bearing=sectors.front_angle,
+                left_bearing=sectors.left_angle,
+                right_bearing=sectors.right_angle,
+                dest_x=me["goal"][0] - me["x"], dest_y=me["goal"][1] - me["y"],
+            )
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    me["x"], me["y"], me["yaw"], aim[0], aim[1], min(front, 3.0),
+                    0.30, 1.0, 0.45,
+                    left=min(left, 3.0), right=min(right, 3.0),
+                    lateral=path_lateral(me["x"], me["y"], path, index),
+                    align=not me["cruise"],
+                )
+                if abs(error) <= 0.30:
+                    me["cruise"] = True
+            else:
+                linear, angular = command
+            if move:
+                me["v"] += max(-0.10, min(0.10, linear - me["v"]))
+                me["w"] += max(-0.20, min(0.20, angular - me["w"]))
+                me["yaw"] += me["w"] * 0.1
+                me["x"] += me["v"] * math.cos(me["yaw"]) * 0.1
+                me["y"] += me["v"] * math.sin(me["yaw"]) * 0.1
+            lateral = abs(path_lateral(me["x"], me["y"], path, me["index"]))
+            return state, linear, lateral
+
+        heading_b = math.pi / 2 if b_dir > 0.0 else -math.pi / 2
+        a = make(ax, 0.0, 0.0, (ax + 8.0, 0.0))
+        b = make(2.0, by, heading_b, (2.0, by + 8.0 * b_dir))
+        sa, sb = AvoidanceState(), AvoidanceState()
+        stats = {
+            "min_gap": self._square_face_gap(ax, 0.0, 0.0, 2.0, by, heading_b),
+            "lat_a": 0.0, "lat_b": 0.0,
+            "rev_a": 0, "rev_b": 0,
+            "min_ax": ax, "max_by": by, "min_by": by,
+        }
+        for step in range(dwell + steps):
+            now = step * 0.1
+            move = step >= dwell
+            snap_a = {"x": a["x"], "y": a["y"], "yaw": a["yaw"]}
+            snap_b = {"x": b["x"], "y": b["y"], "yaw": b["yaw"]}
+            sa, lin_a, lat_a = drive(a, snap_b, sa, now, move)
+            sb, lin_b, lat_b = drive(b, snap_a, sb, now, move)
+            stats["min_gap"] = min(
+                stats["min_gap"],
+                self._square_face_gap(a["x"], a["y"], a["yaw"], b["x"], b["y"], b["yaw"]),
+            )
+            stats["lat_a"] = max(stats["lat_a"], lat_a)
+            stats["lat_b"] = max(stats["lat_b"], lat_b)
+            if move and lin_a < -0.05:
+                stats["rev_a"] += 1
+            if move and lin_b < -0.05:
+                stats["rev_b"] += 1
+            stats["min_ax"] = min(stats["min_ax"], a["x"])
+            stats["max_by"] = max(stats["max_by"], b["y"])
+            stats["min_by"] = min(stats["min_by"], b["y"])
+        stats["ax"], stats["ay"] = a["x"], a["y"]
+        stats["bx"], stats["by"] = b["x"], b["y"]
+        return stats
+
+    def test_robots_already_beside_yield_as_soon_as_they_move(self):
+        # Both are already stopped within lidar range, so each return is an
+        # obstacle before either one has a speed. When they then cross, the
+        # robot that has the other on its right backs up its own line and the
+        # other keeps going. A fresh goal resets that memory; a dwell is the
+        # same pair sitting still with the track already warm.
+        def check(ax, by, direction, dwell, minimum_gap):
+            stats = self._beside_cross(ax, by, direction, dwell=dwell)
+            where = f"A={ax}, B={by}, dir={direction}, dwell={dwell}"
+            self.assertGreater(stats["min_gap"], minimum_gap, where)
+            self.assertLess(stats["lat_a"], 0.20, where)
+            self.assertLess(stats["lat_b"], 0.20, where)
+            self.assertGreater(stats["ax"], 2.40, where)
+            self.assertLess(abs(stats["bx"] - 2.0), 0.35, where)
+            if direction > 0.0:
+                self.assertGreater(stats["by"], 0.80, where)
+                self.assertGreater(stats["rev_a"], 4, where)
+                self.assertLess(stats["min_ax"], ax - 0.04, where)
+                self.assertLess(stats["rev_b"], 4, where)
+            else:
+                self.assertLess(stats["by"], -0.60, where)
+                self.assertGreater(stats["rev_b"], 4, where)
+                self.assertGreater(stats["max_by"], by + 0.04, where)
+                self.assertLess(stats["rev_a"], 4, where)
+
+        for dwell in (0, 15):
+            check(1.6, -0.5, 1.0, dwell, 0.05)
+            check(1.8, -0.4, 1.0, dwell, 0.0)
+            check(1.6, 0.5, -1.0, dwell, 0.05)
+            check(1.8, 0.4, -1.0, dwell, 0.05)
+
+    def test_a_yielder_on_the_approach_does_not_arc_or_reverse_yet(self):
+        # Still more than a metre out. A side pass here yaws the second
+        # robot off its line, and a reverse starts before anyone is beside
+        # the chassis.
+        for ax, by, direction in (
+            (1.80, 1.80, -1.0),
+            (1.80, -1.80, 1.0),
+        ):
+            stats = self._square_cross(ax, 0.0, 2.0, by, b_dir=direction, steps=160)
+            where = f"A from x={ax}, B from y={by}, dir={direction}"
+            self.assertLess(stats["lat_a"], 0.20, where)
+            self.assertLess(stats["lat_b"], 0.20, where)
+            self.assertLess(stats["rev_early_a"], 3, where)
+            self.assertLess(stats["rev_early_b"], 3, where)
+            self.assertGreater(stats["min_d"], 0.55, where)
+
+    def _square_gap(self, rx, ry, yaw, px, py, half=0.15, radius=0.25):
+        dx, dy = px - rx, py - ry
+        c, s = math.cos(yaw), math.sin(yaw)
+        lx = c * dx + s * dy
+        ly = -s * dx + c * dy
+        qx = min(half, max(-half, lx))
+        qy = min(half, max(-half, ly))
+        return math.hypot(lx - qx, ly - qy) - radius
+
+    def _drive_yield(self, x, y, yaw, px, py, vx, vy, state, aim_x=1.4):
+        dx, dy = px - x, py - y
+        dist = math.hypot(dx, dy)
+        bearing = math.atan2(math.sin(math.atan2(dy, dx) - yaw), math.cos(math.atan2(dy, dx) - yaw))
+        reading = max(0.05, dist - 0.18)
+        front = left = right = 4.0
+        front_bearing = 0.0
+        left_bearing = None
+        right_bearing = None
+        if abs(bearing) <= 0.61:
+            front = reading
+            front_bearing = bearing
+        elif bearing > 0.61:
+            left = reading
+            left_bearing = bearing
+        else:
+            right = reading
+            right_bearing = bearing
+        error = math.atan2(math.sin(math.atan2(0.0 - y, aim_x - x) - yaw), math.cos(math.atan2(0.0 - y, aim_x - x) - yaw))
+        command, state = step_avoidance(
+            state, 0.0, x, y, yaw,
+            1.0, 0.0, aim_x - x, 0.0 - y,
+            front, left, right, error,
+            map_range=6.0, map_left=6.0, map_right=6.0,
+            path_x=x, path_y=0.0,
+            bearing=front_bearing,
+            left_bearing=left_bearing,
+            right_bearing=right_bearing,
+        )
+        return command, state
+
+    def test_a_walker_still_far_from_the_robot_is_crossed_in_front(self):
+        # The line x = 0.22 runs through the chassis. Staying put, the 0.25 m
+        # cylinder meets the square. The walker is still 1.2 m up that line,
+        # on the left rather than in the forward cone, so there is time to
+        # accelerate and leave the line before they arrive.
+        px, py = 0.22, 1.20
+        vx, vy = 0.0, -0.20
+        self.assertLess(self._square_gap(0.0, 0.0, 0.0, px, 0.0), 0.0)
+        state = AvoidanceState(
+            track_x=px - vx * 0.1, track_y=py - vy * 0.1,
+            other_speed=0.20, moving_frames=4,
+        )
+        x = y = yaw = 0.0
+        min_gap = 99.0
+        saw_fast = False
+        crossed = False
+        for _step in range(80):
+            command, state = self._drive_yield(x, y, yaw, px, py, vx, vy, state)
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    x, y, yaw, 1.4, 0.0, 3.0, 0.30, 1.0, 0.45,
+                    left=2.0, right=2.0, lateral=abs(y), align=False,
+                )
+            else:
+                linear, angular = command
+            if linear >= 0.40:
+                saw_fast = True
+            yaw += angular * 0.1
+            x += linear * math.cos(yaw) * 0.1
+            y += linear * math.sin(yaw) * 0.1
+            px += vx * 0.1
+            py += vy * 0.1
+            gap = self._square_gap(x, y, yaw, px, py)
+            min_gap = min(min_gap, gap)
+            if x > px + 0.30 and py > y + 0.25:
+                crossed = True
+            if py < y - 0.50:
+                break
+        self.assertTrue(saw_fast)
+        self.assertTrue(crossed)
+        self.assertGreater(min_gap, 0.02)
+
+    def test_a_close_yield_backs_off_and_faces_the_walker(self):
+        # Already stopped, nose about 45° to the walker's line, and the
+        # walker is too close for a sprint to clear them. Holding (0, 0)
+        # leaves a corner in the cylinder.
+        yaw = 0.80
+        px, py = 0.34, 0.42
+        vx, vy = 0.0, -0.22
+        self.assertLess(self._square_gap(0.0, 0.0, yaw, px, 0.0), 0.0)
+        state = AvoidanceState(
+            active=True, side=0.0, started=0.0,
+            track_x=px, track_y=py - vy * 0.1,
+            other_speed=0.22, moving_frames=4,
+        )
+        x = y = 0.0
+        min_gap = 99.0
+        for step in range(50):
+            state.started = 0.0
+            command, state = self._drive_yield(x, y, yaw, px, py, vx, vy, state)
+            self.assertIsNotNone(command)
+            linear, angular = command
+            self.assertLess(linear, 0.30)
+            yaw += angular * 0.1
+            x += linear * math.cos(yaw) * 0.1
+            y += linear * math.sin(yaw) * 0.1
+            px += vx * 0.1
+            py += vy * 0.1
+            min_gap = min(min_gap, self._square_gap(x, y, yaw, px, py))
+            if py < y - 0.40:
+                break
+        self.assertGreater(min_gap, 0.02)
+        # Velocity is straight down, so a flat face looks along x, yaw 0 or pi.
+        err = abs(math.atan2(math.sin(yaw), math.cos(yaw)))
+        err = min(err, abs(math.atan2(math.sin(yaw - math.pi), math.cos(yaw - math.pi))))
+        self.assertLess(err, 0.40)
+
+    def test_a_goal_behind_a_walker_on_the_right_stays_straight(self):
+        # The walker is on our left and walking toward us. The goal is past
+        # them and still on their right. Swinging left, across their front,
+        # then coming back is the long way around.
+        px, py = 1.60, 0.62
+        vx, vy = -0.20, 0.0
+        goal = (3.2, 0.0)
+        state = AvoidanceState(
+            track_x=px - vx * 0.1, track_y=py,
+            track_vx=vx, track_vy=vy,
+            other_speed=0.20, moving_frames=5,
+        )
+        x = y = yaw = 0.0
+        min_gap = 99.0
+        max_abs_yaw = 0.0
+        max_y = 0.0
+        for step in range(50):
+            dx, dy = px - x, py - y
+            dist = math.hypot(dx, dy)
+            bearing = math.atan2(
+                math.sin(math.atan2(dy, dx) - yaw),
+                math.cos(math.atan2(dy, dx) - yaw),
+            )
+            reading = max(0.05, dist - 0.18)
+            front = left = right = 4.0
+            front_bearing = 0.0
+            left_bearing = None
+            right_bearing = None
+            if abs(bearing) <= 0.61:
+                front = reading
+                front_bearing = bearing
+            elif bearing > 0.61:
+                left = reading
+                left_bearing = bearing
+            else:
+                right = reading
+                right_bearing = bearing
+            # The live aim is the 0.80 m path carrot. The goal, behind the
+            # walker and still on their right, is a separate point.
+            error = math.atan2(
+                math.sin(math.atan2(0.0 - y, 0.80) - yaw),
+                math.cos(math.atan2(0.0 - y, 0.80) - yaw),
+            )
+            command, state = step_avoidance(
+                state, step * 0.1, x, y, yaw,
+                1.0, 0.0, 0.80, 0.0 - y,
+                front, left, right, error,
+                map_range=8.0, map_left=8.0, map_right=8.0,
+                path_x=x, path_y=0.0,
+                bearing=front_bearing,
+                left_bearing=left_bearing,
+                right_bearing=right_bearing,
+                dest_x=goal[0] - x, dest_y=goal[1] - y,
+            )
+            if state.active and state.side < 0.0:
+                self.fail("swung left across the walker")
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    x, y, yaw, goal[0], goal[1], min(front, 3.0),
+                    0.30, 1.0, 0.45,
+                    left=2.0, right=2.0, lateral=abs(y), align=False,
+                )
+            else:
+                linear, angular = command
+            yaw += angular * 0.1
+            x += linear * math.cos(yaw) * 0.1
+            y += linear * math.sin(yaw) * 0.1
+            px += vx * 0.1
+            py += vy * 0.1
+            min_gap = min(min_gap, self._square_gap(x, y, yaw, px, py))
+            max_abs_yaw = max(max_abs_yaw, abs(yaw))
+            max_y = max(max_y, y)
+        self.assertGreater(x, 1.0)
+        self.assertLess(max_abs_yaw, 0.45)
+        self.assertLess(max_y, 0.20)
+        self.assertGreater(min_gap, 0.02)
+
+    def _walker_scan(self, x, y, yaw, px, py, radius=0.25):
+        lx = x + 0.15 * math.cos(yaw)
+        ly = y + 0.15 * math.sin(yaw)
+        samples = 360
+        ranges = []
+        for index in range(samples):
+            angle = -math.pi + index * (2.0 * math.pi / samples)
+            direction = yaw + angle
+            dx, dy = math.cos(direction), math.sin(direction)
+            fx, fy = lx - px, ly - py
+            closest = fx * dx + fy * dy
+            disc = closest * closest - (fx * fx + fy * fy - radius * radius)
+            hit = float("inf")
+            if disc >= 0.0:
+                distance = -closest - math.sqrt(disc)
+                if 0.15 < distance <= 3.0:
+                    hit = distance
+            ranges.append(hit)
+        return sector_distances_from_scan(
+            ranges, -math.pi, 2.0 * math.pi / samples, range_min=0.15,
+        )
+
+    def _cross_oncoming_walker(self, lat, vx, vy, goal=(5.0, 0.0)):
+        """Drive at a walker coming the other way. Return min gap and side offset."""
+        state = AvoidanceState()
+        x = y = yaw = 0.0
+        px, py = 2.2, lat
+        min_gap = 99.0
+        max_offset = 0.0
+        held = 99.0
+        committed = False
+        for step in range(100):
+            sectors = self._walker_scan(x, y, yaw, px, py)
+            path = [(0.0, 0.0), (8.0, 0.0)]
+            aim = path_merge_target(x, y, path, 0, 0.0, 0.0)
+            error = math.atan2(
+                math.sin(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+                math.cos(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+            )
+            front = sectors.front
+            left = sectors.left if sectors.left < 900.0 else 4.0
+            right = sectors.right if sectors.right < 900.0 else 4.0
+            command, state = step_avoidance(
+                state, step * 0.1, x, y, yaw,
+                1.0, 0.0, aim[0] - x, aim[1] - y,
+                front if front < 900.0 else 999.0,
+                left, right, error,
+                map_range=6.0, map_left=6.0, map_right=6.0,
+                path_x=0.0, path_y=0.0,
+                bearing=sectors.front_angle,
+                left_bearing=None if sectors.left > 900.0 else sectors.left_angle,
+                right_bearing=None if sectors.right > 900.0 else sectors.right_angle,
+                dest_x=goal[0] - x, dest_y=goal[1] - y,
+            )
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    x, y, yaw, aim[0], aim[1], min(front, 3.0),
+                    0.30, 1.0, 0.45,
+                    left=min(left, 3.0), right=min(right, 3.0),
+                    lateral=abs(y), align=False,
+                )
+            else:
+                linear, angular = command
+            yaw += angular * 0.1
+            x += linear * math.cos(yaw) * 0.1
+            y += linear * math.sin(yaw) * 0.1
+            px += vx * 0.1
+            py += vy * 0.1
+            min_gap = min(min_gap, self._square_gap(x, y, yaw, px, py))
+            max_offset = max(max_offset, abs(y))
+            # Once the offset is taken, coming back while the walker is still
+            # ahead is the collision. Record the tightest offset until they
+            # are behind the chassis.
+            if abs(y) > 0.50:
+                committed = True
+            if committed and (px - x) > -0.45:
+                held = min(held, abs(y))
+            if px < x - 0.8 and step > 15:
+                break
+        return min_gap, max_offset, held
+
+    def test_a_head_on_walker_does_not_reverse_when_the_hit_jumps(self):
+        # One sideways jump of the return used to latch the robot yield.
+        # The chassis then backed up on the centreline for as long as the
+        # walker kept coming, instead of taking its own right.
+        state = AvoidanceState()
+        x = y = yaw = 0.0
+        px, py = 2.2, 0.0
+        path = [(i * 0.2, 0.0) for i in range(40)]
+        index = 0
+        cruise = False
+        reverses = 0
+        max_offset = 0.0
+        for step in range(90):
+            while index < len(path) - 1:
+                waypoint = path[index]
+                if math.hypot(waypoint[0] - x, waypoint[1] - y) < 0.25:
+                    index += 1
+                    continue
+                heading = path_heading(path, index, waypoint[0], waypoint[1], x, y)
+                along_wp = (
+                    (x - waypoint[0]) * math.cos(heading)
+                    + (y - waypoint[1]) * math.sin(heading)
+                )
+                if along_wp > 0.0:
+                    index += 1
+                    continue
+                break
+            kick = 0.12 if step == 18 else 0.0
+            sectors = self._walker_scan(x, y, yaw, px, py + kick)
+            waypoint = path[index]
+            aim = path_merge_target(x, y, path, index, waypoint[0], waypoint[1])
+            heading = path_heading(path, index, waypoint[0], waypoint[1], x, y)
+            lateral = path_lateral(x, y, path, index)
+            error = math.atan2(
+                math.sin(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+                math.cos(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+            )
+
+            def sector(value):
+                return value if value < 900.0 else 999.0
+
+            front = sector(sectors.front)
+            left = sector(sectors.left)
+            right = sector(sectors.right)
+            command, state = step_avoidance(
+                state, step * 0.1, x, y, yaw,
+                math.cos(heading), math.sin(heading),
+                aim[0] - x, aim[1] - y,
+                front, left, right, error,
+                map_range=3.0, map_left=3.0, map_right=3.0,
+                path_x=waypoint[0], path_y=waypoint[1],
+                bearing=sectors.front_angle,
+                left_bearing=sectors.left_angle,
+                right_bearing=sectors.right_angle,
+                dest_x=6.0 - x, dest_y=-y,
+            )
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    x, y, yaw, aim[0], aim[1], min(front, 3.0),
+                    0.30, 1.0, 0.45,
+                    left=min(left, 3.0), right=min(right, 3.0),
+                    lateral=lateral, align=not cruise,
+                )
+                if abs(error) <= 0.30:
+                    cruise = True
+            else:
+                linear, angular = command
+            if linear < -0.05:
+                reverses += 1
+            max_offset = max(max_offset, abs(y))
+            yaw += angular * 0.1
+            x += linear * math.cos(yaw) * 0.1
+            y += linear * math.sin(yaw) * 0.1
+            px -= 0.20 * 0.1
+            if px < x - 0.8 and step > 20:
+                break
+        self.assertLess(reverses, 3)
+        self.assertGreater(max_offset, 0.45)
+        self.assertEqual(state.cross_hold, 0.0)
+
+    def test_a_head_on_walker_clears_the_side(self):
+        # Coming toward the robot, on the line and just off it. The pass used
+        # to yaw them out of the forward cone, give up the offset, and let
+        # the cylinder meet the side. A later return to the centreline, while
+        # they are still in front, is the same collision.
+        for lat in (0.0, 0.15, -0.15, 0.30, -0.30, 0.45, -0.45):
+            gap, offset, held = self._cross_oncoming_walker(lat, -0.20, 0.0)
+            self.assertGreater(gap, 0.10, f"lateral {lat}")
+            if abs(lat) <= 0.15:
+                self.assertGreater(offset, 0.55, f"lateral {lat}")
+                self.assertGreater(held, 0.45, f"lateral {lat}")
+        # A small angle toward the path is still a side, not a graze.
+        gap, _offset, _held = self._cross_oncoming_walker(0.50, -0.18, -0.08)
+        self.assertGreater(gap, 0.10)
+        gap, _offset, _held = self._cross_oncoming_walker(-0.50, -0.18, 0.08)
+        self.assertGreater(gap, 0.10)
+
+    def test_a_head_on_offset_holds_when_the_walker_leaves_the_scan(self):
+        # The offset is already taken. The walker is still in front, but the
+        # yaw has carried them out of the forward cone and the side sector.
+        # An empty scan used to end the pass, and the return to the line met them.
+        state = AvoidanceState(
+            active=True, side=1.0, started=0.0, until=1.9,
+            track_x=0.70, track_y=0.0, track_vx=-0.20, track_vy=0.0,
+            other_speed=0.20, moving_frames=6, seen_off=0.0,
+        )
+        command, state = step_avoidance(
+            state, 2.0, 0.0, -0.65, 0.0,
+            1.0, 0.0, 0.80, 0.65,
+            front=999.0, left=999.0, right=999.0,
+            heading_error=0.70,
+            map_range=6.0, map_left=6.0, map_right=6.0,
+            path_x=0.0, path_y=0.0,
+            dest_x=4.0, dest_y=0.65,
+        )
+        self.assertIsNotNone(command)
+        self.assertTrue(state.active)
+        self.assertGreater(state.side, 0.0)
+        self.assertGreater(command[0], 0.0)
+
+    def test_a_clear_offset_pose_does_not_rejoin_while_the_walker_is_ahead(self):
+        # From the offset pose the straight run looks clear, so the pass was
+        # dropped and the centreline carrot pulled the chassis back across them.
+        bearing = 0.82
+        rang = 0.70
+        x, y, yaw = 0.0, -0.55, 0.0
+        cx = x + (rang + 0.18) * math.cos(yaw + bearing)
+        cy = y + (rang + 0.18) * math.sin(yaw + bearing)
+        state = AvoidanceState(
+            active=True, side=1.0, started=0.0, until=1.9,
+            track_x=cx + 0.02, track_y=cy, track_vx=-0.20, track_vy=0.0,
+            other_speed=0.20, moving_frames=8, seen_off=0.25,
+        )
+        command, state = step_avoidance(
+            state, 2.0, x, y, yaw,
+            1.0, 0.0, 0.80, 0.55,
+            front=999.0, left=rang, right=3.0,
+            heading_error=0.50,
+            map_range=6.0, map_left=6.0, map_right=6.0,
+            path_x=0.0, path_y=0.0,
+            bearing=0.0, left_bearing=bearing,
+            dest_x=4.0, dest_y=0.55,
+        )
+        self.assertIsNotNone(command)
+        self.assertTrue(state.active)
+        self.assertGreater(state.side, 0.0)
+        self.assertGreater(command[0], 0.0)
+
+    def test_a_head_on_offset_is_not_dropped_when_the_hit_slides(self):
+        # The cylinder's closest point slides sideways as the robot yaws, so
+        # the track is no longer "along the path". The walker then leaves the
+        # 110° sector while still in front of the rear face. Dropping the
+        # offset there steers back onto the centreline and the next yaw swings
+        # a rear corner into them. Empty sectors are 999, the same value the
+        # live scan publishes, and the map ray is the 3 m lidar limit.
+        state = AvoidanceState()
+        x = y = yaw = 0.0
+        px, py = 2.2, 0.0
+        vx, vy = -0.20, 0.0
+        goal = (6.0, 0.0)
+        path = [(i * 0.2, 0.0) for i in range(40)]
+        index = 0
+        cruising = False
+        committed = False
+        dropped = False
+        restarts = 0
+        was_active = False
+        min_rear = 99.0
+        min_gap = 99.0
+        for step in range(120):
+            while index < len(path) - 1:
+                waypoint = path[index]
+                if math.hypot(waypoint[0] - x, waypoint[1] - y) < 0.25:
+                    index += 1
+                    continue
+                heading = path_heading(path, index, waypoint[0], waypoint[1], x, y)
+                along_wp = (x - waypoint[0]) * math.cos(heading) + (y - waypoint[1]) * math.sin(heading)
+                if along_wp > 0.0:
+                    index += 1
+                    continue
+                break
+            sectors = self._walker_scan(x, y, yaw, px, py)
+            waypoint = path[index]
+            aim = path_merge_target(x, y, path, index, waypoint[0], waypoint[1])
+            heading = path_heading(path, index, waypoint[0], waypoint[1], x, y)
+            lateral = path_lateral(x, y, path, index)
+            error = math.atan2(
+                math.sin(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+                math.cos(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+            )
+
+            def sector(value):
+                return value if value < 900.0 else 999.0
+
+            front = sector(sectors.front)
+            left = sector(sectors.left)
+            right = sector(sectors.right)
+            true_along = (px - x) * math.cos(heading) + (py - y) * math.sin(heading)
+            command, state = step_avoidance(
+                state, step * 0.1, x, y, yaw,
+                math.cos(heading), math.sin(heading),
+                aim[0] - x, aim[1] - y,
+                front, left, right, error,
+                map_range=3.0, map_left=3.0, map_right=3.0,
+                path_x=waypoint[0], path_y=waypoint[1],
+                bearing=sectors.front_angle,
+                left_bearing=sectors.left_angle,
+                right_bearing=sectors.right_angle,
+                dest_x=goal[0] - x, dest_y=goal[1] - y,
+            )
+            if command is None:
+                linear, angular, _stalling = command_on_path(
+                    x, y, yaw, aim[0], aim[1], min(front, 3.0),
+                    0.30, 1.0, 0.45,
+                    left=min(left, 3.0), right=min(right, 3.0),
+                    lateral=lateral, align=not cruising,
+                )
+            else:
+                linear, angular = command
+            if command is None and abs(error) <= 0.30:
+                cruising = True
+            if lateral > 0.50:
+                committed = True
+            if state.active and not was_active and committed:
+                restarts += 1
+            # Centre still ahead of the rear face: the 0.25 m cylinder reaches
+            # x = -0.15 on the robot. Rejoining here is the second pivot.
+            if committed and true_along > -0.40 and was_active and not state.active:
+                dropped = True
+            was_active = state.active
+            yaw += angular * 0.1
+            x += linear * math.cos(yaw) * 0.1
+            y += linear * math.sin(yaw) * 0.1
+            px += vx * 0.1
+            py += vy * 0.1
+            min_gap = min(min_gap, self._square_gap(x, y, yaw, px, py))
+            min_rear = min(min_rear, self._rear_gap(x, y, yaw, px, py))
+            if true_along < -0.9 and step > 20:
+                break
+        self.assertTrue(committed)
+        self.assertFalse(dropped)
+        self.assertEqual(restarts, 0)
+        self.assertGreater(min_gap, 0.05)
+        self.assertGreater(min_rear, 0.05)
+
+    def test_a_shelf_corner_does_not_hide_a_head_on_walker(self):
+        # The closest front hit is a mapped shelf corner. The walker is the
+        # next ray in the same sector. Using only the minimum never starts
+        # the offset, and the yaw then begins too late for the rear corner.
+        inc = 2.0 * math.pi / 360
+        ranges = [3.0] * 360
+
+        def at(angle: float) -> int:
+            return int(round((angle + math.pi) / inc)) % 360
+
+        ranges[at(0.0)] = 1.70
+        ranges[at(0.40)] = 0.70
+
+        def map_at(angle: float) -> float:
+            if abs(angle - 0.40) < 0.08:
+                return 0.70
+            return 3.0
+
+        body = sector_body_returns(ranges, -math.pi, inc, map_at, range_min=0.15)
+        raw = sector_distances_from_scan(ranges, -math.pi, inc, range_min=0.15)
+        self.assertAlmostEqual(raw.front, 0.70, places=2)
+        self.assertAlmostEqual(body.front, 1.70, places=2)
+        hidden = AvoidanceState(closing=-0.25, last_front=0.80, approach_frames=4)
+        command, hidden = step_avoidance(
+            hidden, 0.4, 0.0, 0.0, 0.0,
+            1.0, 0.0, 1.5, 0.0,
+            front=0.70, left=2.5, right=0.55,
+            heading_error=0.0,
+            map_range=0.70, map_right=0.55,
+            path_x=0.0, path_y=0.0,
+            bearing=0.40,
+        )
+        self.assertFalse(hidden.active)
+        self.assertIsNone(command)
+        seen = AvoidanceState(closing=-0.25, last_front=1.90, approach_frames=4)
+        command, seen = step_avoidance(
+            seen, 0.4, 0.0, 0.0, 0.0,
+            1.0, 0.0, 1.5, 0.0,
+            front=0.70, left=2.5, right=0.55,
+            heading_error=0.0,
+            map_range=3.0, map_right=0.55,
+            path_x=0.0, path_y=0.0,
+            bearing=0.40,
+            open_front=body.front,
+            open_bearing=body.front_angle,
+        )
+        self.assertIsNotNone(command)
+        self.assertTrue(seen.active)
+        self.assertLess(seen.side, 0.0)
+
+    def _rear_gap(self, rx, ry, yaw, px, py, half=0.15, radius=0.25):
+        c, s = math.cos(yaw), math.sin(yaw)
+        best = 99.0
+        for ly in (-half, half):
+            wx = rx + c * (-half) - s * ly
+            wy = ry + s * (-half) + c * ly
+            best = min(best, math.hypot(px - wx, py - wy) - radius)
+        return best
+
+    def test_a_head_on_offset_ends_once_the_walker_is_behind(self):
+        state = AvoidanceState(
+            active=True, side=1.0, started=0.0, until=1.9,
+            track_x=-0.80, track_y=0.0, track_vx=-0.20, track_vy=0.0,
+            other_speed=0.20, moving_frames=6, seen_off=0.0,
+        )
+        command, state = step_avoidance(
+            state, 2.0, 0.0, -0.65, 0.0,
+            1.0, 0.0, 0.80, 0.65,
+            front=999.0, left=999.0, right=999.0,
+            heading_error=0.40,
+            map_range=6.0, map_left=6.0, map_right=6.0,
+            path_x=0.0, path_y=0.0,
+            dest_x=4.0, dest_y=0.65,
+        )
+        self.assertIsNone(command)
+        self.assertFalse(state.active)
 
     def test_a_head_on_pass_stays_right_when_the_other_slides_left(self):
         # The pass starts on the axis. Later the other robot sits to our left
@@ -1092,6 +2419,68 @@ class PursuitTests(unittest.TestCase):
         self.assertAlmostEqual(x, -3.7, delta=0.08)
         self.assertGreater(yaw, 1.2)
         self.assertGreater(y, -3.5)
+
+    def test_a_stationary_robot_off_the_path_does_not_stop_the_passer(self):
+        # The other chassis is parked to the right of a straight eastbound
+        # leg. It is not on the line and it does not move. Driving past slides
+        # the lidar hit, and one cross-track sample used to latch a yield.
+        # The parked robot never crosses the path, so the stop never ended.
+        for lateral in (0.40, 1.10, 2.80):
+            other = (1.6, -lateral)
+            path = [(i * 0.2, 0.0) for i in range(30)]
+            state = AvoidanceState()
+            x = y = yaw = 0.0
+            index = 0
+            stopped = 0
+            yielded = 0
+            for step in range(120):
+                now = step * 0.1
+                while index < len(path) - 1 and math.hypot(path[index][0] - x, path[index][1] - y) < 0.25:
+                    index += 1
+                look = path_lookahead(path, index, x, y, 0.60)
+                aim = path_merge_target(x, y, path, index, look[0], look[1])
+                heading = path_heading(path, index, look[0], look[1], x, y)
+                ranges, inc = self._square_robot_ranges(x, y, yaw, other[0], other[1], 0.0)
+                sectors = sector_distances_from_scan(ranges, -math.pi, inc, range_min=0.15)
+                front = sectors.front if sectors.front < 900.0 else 999.0
+                left = sectors.left if sectors.left < 900.0 else 999.0
+                right = sectors.right if sectors.right < 900.0 else 999.0
+                error = math.atan2(
+                    math.sin(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+                    math.cos(math.atan2(aim[1] - y, aim[0] - x) - yaw),
+                )
+                command, state = step_avoidance(
+                    state, now, x, y, yaw,
+                    math.cos(heading), math.sin(heading),
+                    aim[0] - x, aim[1] - y,
+                    front, left, right, error,
+                    map_range=3.0, map_left=3.0, map_right=3.0,
+                    path_x=look[0], path_y=look[1],
+                    bearing=sectors.front_angle,
+                    left_bearing=sectors.left_angle,
+                    right_bearing=sectors.right_angle,
+                    dest_x=5.0 - x, dest_y=0.0 - y,
+                )
+                if command is None:
+                    linear, angular, _stalling = command_on_path(
+                        x, y, yaw, aim[0], aim[1], min(front, 3.0),
+                        0.30, 1.0, 0.45,
+                        left=min(left, 3.0), right=min(right, 3.0),
+                        lateral=path_lateral(x, y, path, index),
+                        align=False,
+                    )
+                else:
+                    linear, angular = command
+                if linear < 0.05:
+                    stopped += 1
+                if state.cross_hold != 0.0:
+                    yielded += 1
+                yaw += angular * 0.1
+                x += linear * math.cos(yaw) * 0.1
+                y += linear * math.sin(yaw) * 0.1
+            self.assertLess(stopped, 5, lateral)
+            self.assertLess(yielded, 5, lateral)
+            self.assertGreater(x, other[0] + 0.40, lateral)
 
     def test_a_stationary_robot_is_passed_like_a_pedestrian(self):
         other = (2.2, 0.0)
