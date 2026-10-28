@@ -38,7 +38,7 @@ A wall closer than 0.45 m cuts the forward speed. The robot pivots in place only
 
 Another robot, or a person, is passed only when the forward lidar return is shorter than the wall already on the map, it is closing inside 1.80 m, and one side is usable. A shelf, a wall that matches the map, or a shelf corner in a narrow gap does not start an offset. The parallel is 0.75 m, taken before the robot draws level with the other. The offset does not grow past that line. Head-on, each robot takes its own right when that side leaves 1.20 m, which keeps the other on its left. If the other is already off one side of the trajectory, the offset goes to the opposite side from 0.55 m. A yawed nose does not change that side. The pass ends when the other has left the front and the flank, when the chosen side drops under 0.50 m, or when both sides are the mapped corridor again. The mission is released only after 4 s blocked on both sides.
 
-When two robots are moving and one arrives on the right-hand side of the other, the arriving robot stops if its trajectory stays to the right, or shifts left to pass behind if its trajectory goes left. A stationary robot, and a person who does not cut the line, keep the ordinary offset. A person walking at 0.20 m/s can trigger the same stop as a moving robot.
+When two robots are moving and one arrives on the right-hand side of the other, the arriving robot stops if its trajectory stays to the right, or shifts left to pass behind if its trajectory goes left. When the paths are perpendicular, priority is the robot that has the other on its left. That robot stays on its line and does not stop. The other stops on its line, backs up along that line if it is already in the crossing, and goes on once the first is past the path. Two robots that were already stopped beside each other are the same rule: each lidar sees the neighbour before either one is moving, and the robot that has the other on its right still backs up as soon as both start. Neither one steps aside. A stationary robot, and a person who does not cut the line, keep the ordinary offset. A person walking at 0.20 m/s is that same crossing, including when they are still in the side lidar sector. If their line crosses the robot and there is time, the robot accelerates to 0.42 m/s and passes in front. If not, it backs off their line and turns until a flat side faces them, so a corner of the chassis does not meet the 0.25 m cylinder. A person coming toward the robot, on the line or just off it, gets that same side offset and the robot keeps it until they are behind the chassis. Leaving the forward or side lidar sector does not end that pass: dropping the offset early leaves the cylinder in the side of the chassis. When the goal is already past that person and they are far enough to the side that a straight run stays clear, the robot follows the path. Another robot that is already too close keeps the full stop.
 
 Three people (a 0.25 m cylinder and a head, as in project 1) walk back and forth: red at y = 1.2 m, blue at x = −3.6 m, green at x = 1.5 m. They are not on the map, so the lidar treats them as a robot.
 
@@ -96,7 +96,9 @@ The RobotModel TF prefix in RViz is `robot_1` with no trailing slash. RViz adds 
 
 **Wrong side, then an offset that was too short.** The nose angle, rather than the path angle, sent the offset toward the robot already on that side. A 0.55 m parallel was then reached only once the chassis were level, and the pass was cancelled because the other robot was the short return on the trailing flank. The side is chosen against the path. The parallel is 0.75 m and it is taken before drawing level. The pass is not cancelled while that short return is the other robot rather than the map. Head-on, each robot keeps its own right.
 
-**A moving robot that cuts the line.** The robot that saw it on the left offset right, followed it, then came back left into it. If it arrives on the other's right and the trajectory stays to the right, it stops until the other has cleared the front. If it is already offset to the left, that offset is the pass behind and does not become a stop.
+**A moving robot that cuts the line.** The robot that saw it on the left offset right, followed it, then came back left into it. If it arrives on the other's right and the trajectory stays to the right, it stops until the other has cleared the front. On two perpendicular paths, the robot that has the other on its right stops on its line and resumes, still on the line, once the other is past the crossing. The one with priority keeps its line and does not stop, including when the other's lidar speed dips into the walker band while they are still in front. A robot standing still off the line does not stop the one driving past, and a dropped or wobbling return does not turn that pass into a creep and a reverse. Neither one steps aside to pass the other, including when a sweep jitters or drops the return for a frame: that side pass is what brought them back into each other. Who is closer is not the rule: that lidar range flipped the choice between identical runs.
+
+**A yield stop on the walker's line.** The stop used to freeze the chassis wherever it was. A corner then met the cylinder, or the robot stayed in the way when the walker was still far enough to cross in front. The yield now accelerates to 0.42 m/s along the path when that crossing is in time. Otherwise it reverses clear of the walker's line and yaws until a flat face is across it. A walker coming along the path is given the full side offset until they are behind the chassis, including after they leave the side sector. The straight run is only when they are already far enough aside that the side stays clear. When the goal is past them on that side, the robot follows the path. The stop for another robot that has already cut across stays a stop.
 
 ## Numbers
 
@@ -117,7 +119,8 @@ The RobotModel TF prefix in RViz is `robot_1` with no trailing slash. RViz adds 
 | Blocked on both sides | mission released after 4 s |
 | Mission with no 0.30 m of progress | cancelled at 30 s, robot excluded for 8 s |
 | Saved map | 496 × 534 cells, 0.02 m, origin about (−8.35, −5.70) |
-| Tests | 78 of 80 pass. The two failures are `robot_3`'s spawn and its old demo goal, outside the free area of this map |
+| Walker crossing | Full side offset when they come along the path, held until they are behind the chassis; 0.42 m/s in front when their line crosses and there is time; straight only when they are already clear to the side |
+| Tests | 99 of 101 pass. The two failures are `robot_3`'s spawn and its old demo goal, outside the free area of this map |
 
 Known free space runs about from x = −4.4 to 2.4 m and y = −4.5 to 2.7 m. The top of the map is unknown, so it is not traversable.
 
@@ -129,13 +132,39 @@ Nav2, Open-RMF, one SLAM map per robot, and a physical robot are outside this re
 
 ## Demo video
 
-Place a short screen capture in `media/demo.gif` or `media/demo.mp4` showing:
+Four captures of the live fleet.
 
-1. The three robots and the three walkers in Gazebo.
-2. A Publish Point click on one robot, then a click on its goal in RViz.
-3. That robot following the path while the other two stay put, including a pass around another robot or a walker.
+### The green robot passes the parked orange robot
 
-Capture tips are in [`media/README.md`](media/README.md). Until the file is added, run the live demo with `./start_fleet_demo.sh --gui`.
+<video src="media/Screencast%20From%202026-10-28%2014-58-50.mp4" width="1280" controls></video>
+
+[Screencast From 2026-10-28 14-58-50.mp4](media/Screencast%20From%202026-10-28%2014-58-50.mp4)
+
+The green robot crosses the open floor and passes the parked orange robot on the shelf side, then continues. The blue robot stays at the bottom of the aisle.
+
+### The blue robot passes the pedestrian in its aisle
+
+<video src="media/Screencast%20From%202026-10-28%2015-05-12.mp4" width="1280" controls></video>
+
+[Screencast From 2026-10-28 15-05-12.mp4](media/Screencast%20From%202026-10-28%2015-05-12.mp4)
+
+The blue robot drives along the aisle beside the shelf, meets the blue pedestrian walking there, and passes on the wall side with a gap. The green and orange robots stay where they are.
+
+### The orange robot crosses while the green robot waits
+
+<video src="media/Screencast%20From%202026-10-28%2015-07-11.mp4" width="1280" controls></video>
+
+[Screencast From 2026-10-28 15-07-11.mp4](media/Screencast%20From%202026-10-28%2015-07-11.mp4)
+
+The two paths cross. The orange robot follows its curve and goes past the green robot. The green robot stays on its straight path and waits until the orange robot has passed.
+
+### The green robot drives around the shelf
+
+<video src="media/Screencast%20From%202026-10-28%2015-07-45.mp4" width="1280" controls></video>
+
+[Screencast From 2026-10-28 15-07-45.mp4](media/Screencast%20From%202026-10-28%2015-07-45.mp4)
+
+The green robot follows its path around the end of the shelf and along the far side. The orange robot stays in the central aisle.
 
 ## Layout
 
@@ -148,7 +177,7 @@ src/fleet_nav/                 ament_python package
   maps/                        saved grid
   urdf/ worlds/
 tests/                         unittest, no ROS
-media/                         future demo.gif or demo.mp4
+media/                         four demo screencasts
 docs/architecture.md
 docs/ROADMAP.md
 ```

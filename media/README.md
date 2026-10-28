@@ -1,27 +1,12 @@
 # Demo media
 
-Add a portfolio-ready capture here:
+The four screencasts here are the clips in the repository README.
 
-| File | Purpose |
-|------|---------|
-| `demo.gif` or `demo.mp4` | 20–40 s clip of the three-robot demo |
+| File | Situation |
+|------|-----------|
+| `Screencast From 2026-10-28 14-58-50.mp4` | Green robot passes the parked orange robot |
+| `Screencast From 2026-10-28 15-05-12.mp4` | Blue robot passes the pedestrian in its aisle |
+| `Screencast From 2026-10-28 15-07-11.mp4` | Orange robot crosses; green robot waits on its path |
+| `Screencast From 2026-10-28 15-07-45.mp4` | Green robot follows its path around the shelf |
 
-## Recommended capture (host)
-
-```bash
-# Terminal 1
-./start_fleet_demo.sh --gui
-
-# Then record Gazebo + RViz with your preferred tool, e.g.:
-# - GNOME Screenshot / SimpleScreenRecorder
-# - OBS Studio
-# - wf-recorder / peek (GIF)
-```
-
-**Shot list:**
-
-1. Gazebo: blue, orange, and green robots, plus the three walking people.
-2. RViz Publish Point: click one robot (within 0.7 m), then click its goal. The other two do not move.
-3. The selected robot follows the planned line and passes another robot or a walker.
-
-Keep the width at or below 1280 px so the clip embeds in the GitHub README.
+Recorded from `./start_fleet_demo.sh --gui`, with Gazebo and RViz on screen.
